@@ -539,24 +539,58 @@ class GaussianModel:
 
 
     # statis grad information to guide liftting. 
+    #     | 参数名                      | 类型                           | 含义                                         |
+    # | ------------------------ | ---------------------------- | ------------------------------------------ |
+    # | `viewspace_point_tensor` | `torch.Tensor [N, 3]`        | 当前所有可见高斯在屏幕空间的坐标 (需有 `.grad`)              |
+    # | `opacity`                | `Tensor [N × n_offsets, 1]`  | 每个 offset 的预测不透明度                          |
+    # | `update_filter`          | `BoolTensor [N × n_offsets]` | 是否当前迭代选择更新该 offset                         |
+    # | `offset_selection_mask`  | `BoolTensor [N × n_offsets]` | 当前哪些 offset 有效（比如不透明度大于 0）                 |
+    # | `anchor_visible_mask`    | `BoolTensor [N]`             | 当前哪些 anchor 可见（即其至少一个 offset 在屏幕中被 raster） |
+            # 此函数为 neural Gaussian 点云 提供以下关键训练统计量：
+            # opacity_accum	每个 anchor 所有 offset 的总不透明度累计	判断是否“足够重要”，不重要的点未来可删除或不扩展
+            # anchor_demon	每个 anchor 被访问的次数	用于后续稀疏性分析或平滑控制
+            # offset_gradient_accum	offset 屏幕空间的梯度幅度累计	用于判断是否应该 liftting（增加 offset / 高斯）
+            # offset_denom	有效梯度累计的次数	配合上面做平均梯度计算
+            #     这些统计信息可用于后续控制：
+            #     点是否保留；
+            #     是否 densify；
+            #     是否更新；
+            #     或用于动态调节学习率 / 优先级。
     def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
         # update opacity stats
+        # 1️⃣ 更新 opacity 累计值（用于控制是否应该复制）
+            # 将每个 anchor 的所有 offset 的 opacity 累加。
+            # self.opacity_accum 是一个 [N, 1] 张量，记录每个 anchor 被渲染时累计的总不透明度。
+            # 用于衡量 anchor 的“可见度”或“重要程度”。
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
-        
         temp_opacity = temp_opacity.view([-1, self.n_offsets])
+        # 记录每个 anchor 被渲染时累计的总不透明度
         self.opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)
-        
+
+        # 2️⃣ 更新 anchor 被访问的次数
+        # 每次当前 anchor 被认为“可见”，其值就 +1。
+        # 可用于归一化或判断哪些 anchor 长期未被使用。
         # update anchor visiting statis
+        # anchor_demon 是每个 anchor 的访问次数累计器。
         self.anchor_demon[anchor_visible_mask] += 1
 
+        # 3️⃣ 构建 offset 的梯度更新掩码 combined_mask
+        # 将 [N] 的 anchor 可见掩码广播成 [N × n_offsets]。
+        # 然后将其中有效的 offset（即 selection_mask 为 True）更新到 combined_mask 中。
         # update neural gaussian statis
         anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
         combined_mask = torch.zeros_like(self.offset_gradient_accum, dtype=torch.bool).squeeze(dim=1)
         combined_mask[anchor_visible_mask] = offset_selection_mask
+
+        # 进一步用 update_filter 细化掩码，只保留当前 offset 中“真正用于反向传播”的部分。
         temp_mask = combined_mask.clone()
         combined_mask[temp_mask] = update_filter
-        
+
+        # 4️⃣ 累计 screen-space 梯度强度（用于判断 offset 是否重要）
+        # 获取每个可更新 offset 在 屏幕空间 (x,y) 上的梯度强度 ||∇xy||。
+        # 用 offset_gradient_accum 累计该 offset 的梯度幅度。
+        # offset_denom 用于记录参与的次数（后续可计算平均梯度强度）。
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
