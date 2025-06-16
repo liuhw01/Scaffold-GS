@@ -25,49 +25,63 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
 
+    # 2️⃣ 相机方向计算
     ## get view properties for anchor
-    ob_view = anchor - viewpoint_camera.camera_center
+        # 对每个 anchor，计算其相对于相机的方向和距离。
+        # 用于构造视角相关的 embedding。
+    ob_view = anchor - viewpoint_camera.camera_center  # N x 3
     # dist
-    ob_dist = ob_view.norm(dim=1, keepdim=True)
+    ob_dist = ob_view.norm(dim=1, keepdim=True)      # N x 1
     # view
-    ob_view = ob_view / ob_dist
+    ob_view = ob_view / ob_dist      # 单位方向向量
 
     ## view-adaptive feature
     if pc.use_feat_bank:
         cat_view = torch.cat([ob_view, ob_dist], dim=1)
-        
+        # 通过 MLP(view dir + dist) 输出三种权重 w1, w2, w3（用于融合不同分辨率的特征）。
         bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1) # [n, 1, 3]
 
         ## multi-resolution feat
+        # 多分辨率特征融合：融合 coarse / medium / fine 的 anchor 特征分量。
         feat = feat.unsqueeze(dim=-1)
         feat = feat[:,::4, :1].repeat([1,4,1])*bank_weight[:,:,:1] + \
             feat[:,::2, :1].repeat([1,2,1])*bank_weight[:,:,1:2] + \
             feat[:,::1, :1]*bank_weight[:,:,2:]
         feat = feat.squeeze(dim=-1) # [n, c]
 
-
+    # 4️⃣ 拼接视角特征用于 MLP 输入
+    后续用不同拼接形式用于 opacity / color / cov MLP 输入。
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+
+    # 5️⃣ Appearance 编码融合（可选）
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
+        # 通过相机 ID 获取可学习的 appearance embedding，作为颜色输入的一部分。
+        # self.embedding_appearance = Embedding(num_cameras, self.appearance_dim).cuda()
         appearance = pc.get_appearance(camera_indicies)
 
     # get offset's opacity
+    # 6️⃣ 不透明度预测 + 掩码生成
     if pc.add_opacity_dist:
         neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
     # opacity mask generation
+    # 输入为 (feat + view) 或 (feat + view + dist)。
+    # 只保留预测不透明度大于 0 的点。
     neural_opacity = neural_opacity.reshape([-1, 1])
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
-
     # select opacity 
     opacity = neural_opacity[mask]
 
     # get offset's color
+    # 7️⃣ 颜色预测
+    # 颜色预测考虑 feat + view [+ appearance]。
+    # 输出展开为每个 offset 对应的 RGB 值。
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
             color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
@@ -81,6 +95,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
     # get offset's cov
+    # 8️⃣ 协方差（缩放 + 旋转）预测
+    # 7维输出 = 3维 scale logits + 4维 rotation 四元数参数。
     if pc.add_cov_dist:
         scale_rot = pc.get_cov_mlp(cat_local_view)
     else:
@@ -88,6 +104,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
     
     # offsets
+    # 9️⃣ offset 和 anchor 组合得到 Gaussian 中心
+    # 将偏移乘以 anchor 的前 3 个缩放值。
+    # 得到最终的 xyz 高斯中心位置。
+    # 同时解出 scaling 和 rotation。
     offsets = grid_offsets.view([-1, 3]) # [mask]
     
     # combine for parallel masking
