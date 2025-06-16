@@ -107,6 +107,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    
+                    # ✅ 功能：将网络渲染出的图像 net_image 转换成网络传输可用的字节流 net_image_bytes。
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -121,8 +123,27 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        
+        # ✅ 功能：从训练集相机中随机挑选一个视角用于本次渲染训练。
+        # scene.getTrainCameras() 会返回所有训练相机视角；
+        # randint(...) 随机抽取一个；
+        # 用 pop() 从堆栈中移除并返回。
+        # 📌 每轮训练都用不同视角渲染，保证视角多样性，防止过拟合。
         # Pick a random Camera
+            # viewpoint_cam = {
+            #     "image_name": str,                  # 图像名称，例如 "00010"
+            #     "original_image": torch.Tensor,     # 对应视角的 Ground Truth 图像，形状为 (3, H, W)
+            #     "image_width": int,                 # 图像宽度
+            #     "image_height": int,                # 图像高度
+            #     "colmap_id": int,                   # COLMAP 中该视角的 ID
+            
+            #     # 相机参数
+            #     "K": torch.Tensor,                  # 内参矩阵 (3, 3)
+            #     "R": torch.Tensor,                  # 相机旋转矩阵 (3, 3)
+            #     "T": torch.Tensor,                  # 相机平移向量 (3,)
+            #     "world_view_transform": torch.Tensor,  # 世界到相机的 4x4 变换矩阵
+            #     "full_proj_transform": torch.Tensor,   # 相机投影矩阵 (4x4)，用于渲染投影
+            #     "camera_center": torch.Tensor,         # 相机中心在世界坐标下的位置 (3,)
+            # }
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
@@ -130,7 +151,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        
+
+        # ✅ 功能：根据当前相机视角判断哪些高斯是可见的，提前过滤掉不可见体素，加快渲染和梯度计算速度。
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
@@ -171,6 +193,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
+                    # 动态增删锚点（anchor），提升表示能力的同时压缩冗余。
+                    # 该函数主要完成两件事：
+                    #     新增 anchor：根据 offset 的梯度是否足够大（代表高频变化）。
+                    #     删除 anchor：根据 opacity 是否太小（代表冗余或无效）。
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
