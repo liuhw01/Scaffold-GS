@@ -589,10 +589,11 @@ class GaussianModel:
 
         # 4️⃣ 累计 screen-space 梯度强度（用于判断 offset 是否重要）
         # 获取每个可更新 offset 在 屏幕空间 (x,y) 上的梯度强度 ||∇xy||。
-        # 用 offset_gradient_accum 累计该 offset 的梯度幅度。
-        # offset_denom 用于记录参与的次数（后续可计算平均梯度强度）。
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        
+        # 用 offset_gradient_accum 累计该 offset 的梯度幅度。
         self.offset_gradient_accum[combined_mask] += grad_norm
+        # offset_denom 用于记录参与的次数（后续可计算平均梯度强度）。
         self.offset_denom[combined_mask] += 1
 
         
@@ -646,9 +647,19 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
+    # 在训练中根据梯度强度选出高质量的 Neural Gaussian offset，并通过其位置生成新的 anchor（锚点），以逐步细化场景。
+        # grads:         [N * k]     每个 offset 的屏幕空间梯度范数（用于衡量重要性）
+        # offset_mask:   [N * k]     哪些 offset 是有效的（训练次数足够多）
+        # threshold:     float       用于挑选高梯度点的阈值
+    # 这个函数最终会：
+    #     筛出高梯度 offset；
+    #     计算其空间位置；
+    #     用 空间体素量化 + 去重，确定哪些位置可以放新 anchor；
+    #     并生成对应的属性（scale、rotation、feature、offset 等），拼接进主网络的参数。
     def anchor_growing(self, grads, threshold, offset_mask):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
+        # 1️⃣ 多层次更新：分层调整阈值
         for i in range(self.update_depth):
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
@@ -668,6 +679,9 @@ class GaussianModel:
             else:
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
 
+            # 2️⃣ 选出候选 offset 点 → 对应空间位置
+                # 将 offset 坐标应用在 anchor 上，计算实际 3D 位置；
+                # 得到的是当前选中要“生 anchor”的位置。
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
             
             # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
@@ -744,35 +758,54 @@ class GaussianModel:
                 self._opacity = optimizable_tensors["opacity"]
                 
 
-
+    # 动态增删锚点（anchor），提升表示能力的同时压缩冗余。
+    # 该函数主要完成两件事：
+    #     新增 anchor：根据 offset 的梯度是否足够大（代表高频变化）。
+    #     删除 anchor：根据 opacity 是否太小（代表冗余或无效）。
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
         # # adding anchors
+        # 🔵 第一步：判断是否新增 anchor
+        # grads：每个 offset 的累积梯度平均值
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
+        # grads_norm：每个 offset 的 L2 范数（即是否发生了强烈的反向传播）
         grads_norm = torch.norm(grads, dim=-1)
-        offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
+        # offset_denom 是每个 offset 的访问次数（用于统计是否足够“稳定”）
+        # 条件：若某个 offset 被访问次数 > check_interval * 0.4，说明参与训练较多，可用于判断是否该生成新 anchor
+        offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+
+        # 在上面两个条件满足下：
+        #     若某个 offset 的梯度大于 grad_threshold
+        #     并且 offset 访问足够多 → 就 新增 anchor（在当前 voxel grid 内插）
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
         
         # update offset_denom
+        # 🟡 第二步：重置 offset 的梯度统计信息（避免累计过旧）
         self.offset_denom[offset_mask] = 0
+        self.offset_gradient_accum[offset_mask] = 0
+        
+        # 🔧 补齐 offset 统计数组长度（可能因 anchor 增长而维度不匹配）
         padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
                                            dtype=torch.int32, 
                                            device=self.offset_denom.device)
         self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
-
-        self.offset_gradient_accum[offset_mask] = 0
         padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_gradient_accum.shape[0], 1],
                                            dtype=torch.int32, 
                                            device=self.offset_gradient_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
         
         # # prune anchors
+        # 🔴 第三步：判断是否删除 anchor（prune）
+        # opacity_accum：每个 anchor 所有 offset 的累计透明度
+        # anchor_demon：该 anchor 被访问了多少次
+        # 某个 anchor 在多次访问中，始终透明度很低 → 基本没贡献 → 可以删
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
         
         # update offset_denom
+        # 🔁 同步更新相关张量，删除对应 anchor 后的 offset 信息：
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
         offset_denom = offset_denom.view([-1, 1])
         del self.offset_denom
@@ -796,9 +829,19 @@ class GaussianModel:
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
 
+        # ✂️ 真正执行 anchor 删除
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
-        
+
+        # 🔄 最后：重置 max_radii2D，每次 anchor 数量变化后，2D 投影半径需要重新统计，用于后续训练或显示。
+        # self.max_radii2D 是一个用于 记录每个高斯锚点（anchor）在屏幕空间中最大投影半径 的张量，主要用于 训练中的可视性判断、稀疏化（剔除）和显存优化。
+        # ✅ 1. 判断 anchor 是否被看到
+        #     在训练循环中，render() 函数通过 rasterizer(...) 得到每个 Gaussian 被投影到屏幕上后的半径 radii，可用于判断该点是否在视锥中、有足够影响力：
+        # ✅ 2. 判断是否需要 densify / prune（添加/删除）
+        #     在密度调度阶段：
+        #     如果某个 anchor 的 max_radii2D[i] 长期为 0，说明它 从未被任何视角看到，可以被安全剔除（prune）。
+        # ✅ 3. 显存优化 / 视锥裁剪（frustum culling）
+            # 可以在前期判断哪些 Gaussians 没有进入视锥，跳过它们的 forward，节省算力和显存。
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
