@@ -239,7 +239,7 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
 
     # 🔸 第 3 步：准备输入 Gaussians 信息
     # 我们这里只对 原始 anchor 点的位置 进行判断（没有生成 neural Gaussian），用于快速判定哪些 anchor 可见。
-    means3D = pc.get_anchor
+    means3D = pc.get_anchor   # 每个 anchor 的 3D 坐标
 
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
