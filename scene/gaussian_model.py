@@ -227,42 +227,75 @@ class GaussianModel:
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
+        # data: 输入点云数据，通常是 N × 3 的 NumPy 数组，表示 N 个三维坐标点。
+        # voxel_size: 每个体素的边长，用于控制采样粒度（默认 1cm 精度）。
         np.random.shuffle(data)
+        
+        # 这行是核心操作：
+        #     data / voxel_size: 将点云坐标转换为单位体素索引（变成浮点数格点坐标）
+        #     np.round(...): 四舍五入为整数索引（离散化成 voxel 编号）
+        #     np.unique(..., axis=0): 去重，仅保留每个 voxel 中的一个点（随机打乱后的第一个）
+        #     * voxel_size: 将整数体素索引还原为真实坐标值（即体素中心位置）
+        #     ✅ 效果：
+        #     相当于将 3D 空间划分为一个体素网格，每个体素最多保留一个点，达到点云稀疏化和去冗余的目的。
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
         
         return data
 
+    # 从输入点云 pcd 创建一组初始的 anchor points，用于高斯建模，并初始化相关属性张量。
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+        # 1️⃣ 设置空间学习率缩放因子
         self.spatial_lr_scale = spatial_lr_scale
+
+        # 从输入点云中每 self.ratio 个点采样一个点（下采样），控制初始 anchor 数量。
         points = pcd.points[::self.ratio]
 
+        # 3️⃣ 自动估计 voxel_size（如果未设定）
         if self.voxel_size <= 0:
+            # 将采样点转为 GPU 上的 tensor，并调用 distCUDA2 函数计算 每个点到最近邻点的距离。
             init_points = torch.tensor(points).float().cuda()
             init_dist = distCUDA2(init_points).float().cuda()
+
+            # 取中位数作为初始体素大小（较稳健，避免极端值影响）
             median_dist, _ = torch.kthvalue(init_dist, int(init_dist.shape[0]*0.5))
             self.voxel_size = median_dist.item()
+
+            # 手动释放临时显存资源
             del init_dist
             del init_points
             torch.cuda.empty_cache()
 
         print(f'Initial voxel_size: {self.voxel_size}')
         
-        
+        # 将点云做 voxel 化（如 3D 网格采样），只保留每个体素中心的一个点，进一步压缩稠密点云
         points = self.voxelize_sample(points, voxel_size=self.voxel_size)
+
+        # 转换为 GPU tensor，准备作为初始 anchor 坐标
         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
+
+        # 每个 anchor 初始化为 self.n_offsets 个偏移（即生成多个高斯点）
+        # 每个 anchor 还分配一个 feat_dim 维的特征向量，全初始化为0
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
         anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
+
         
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
+        
+        # 6️⃣ 计算初始的高斯尺度参数
+        # 跟前面类似，估计每个 anchor 到最近邻的距离
+        # 用于设置尺度 scale，然后重复复制到6维（高斯协方差参数），再取 log 作为可学习变量
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
-        
+
+        # 7️⃣ 初始化旋转四元数
+        # 初始化为单位四元数 [1, 0, 0, 0]，表示无旋转（3D Gaussian 的方向初始不偏转）
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
+        # 用 inverse_sigmoid(0.1) 得到一个在 sigmoid 空间中的值（通常用于使 sigmoid(opacity) 初始约为 0.1）
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        # 9️⃣ 注册为模型参数（用于训练）
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
         self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
