@@ -183,6 +183,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 }
 
 
+
+# | 参数                 | 类型                 | 含义                                    |
+# | ------------------ | ------------------ | ------------------------------------- |
+# | `viewpoint_camera` | `Camera` 类对象       | 当前视角的相机参数，含内外参、图像尺寸、相机中心等             |
+# | `pc`               | `GaussianModel` 对象 | 包含 anchor、scaling、rotation、cov 等场景点属性 |
+# | `pipe`             | `PipelineParams`   | 渲染控制参数（是否用预计算协方差等）                    |
+# | `bg_color`         | `torch.Tensor`     | 背景色张量 (3,)                            |
+# | `scaling_modifier` | `float`            | 缩放因子，用于调整 Gaussians 大小                |
+# | `override_color`   | 忽略                 | 没有用到                                  |
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 
@@ -190,6 +199,8 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     Background tensor (bg_color) must be on GPU!
     """
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    # 🔸 第 1 步：初始化屏幕空间点 screenspace_points
+    # 创建与 anchor 数量相同的张量，仅用于保留梯度（其实这个在 prefilter_voxel 中并没有实际用途，因为不参与 backward，只是为了统一 API）。
     screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
@@ -200,6 +211,14 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+    # 🔸 第 2 步：设置 rasterizer（光栅化器）参数
+        # image_height, image_width：图像大小（从 viewpoint_camera 取）
+        # tanfovx, tanfovy：视场角的正切值
+        # bg：背景颜色
+        # scale_modifier：缩放因子
+        # viewmatrix、projmatrix：从世界坐标到屏幕空间的投影矩阵
+        # campos：相机位置
+        # debug：是否开启调试
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -215,13 +234,17 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         debug=pipe.debug
     )
 
+    
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+    # 🔸 第 3 步：准备输入 Gaussians 信息
+    # 我们这里只对 原始 anchor 点的位置 进行判断（没有生成 neural Gaussian），用于快速判定哪些 anchor 可见。
     means3D = pc.get_anchor
 
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
+    # 接下来判断是否使用预计算协方差（cov3D_precomp）：
     scales = None
     rotations = None
     cov3D_precomp = None
@@ -231,6 +254,11 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
+    # 这个调用是 重点：
+    #     它会把每个 3D anchor 投影到屏幕空间；
+    #     计算其在屏幕上的半径（影响范围）；
+    #     返回 radii_pure：形状为 [N] 的向量，表示每个点的屏幕投影半径；
+    #     小于等于 0 的半径视为不可见。
     radii_pure = rasterizer.visible_filter(means3D = means3D,
         scales = scales[:,:3],
         rotations = rotations,
